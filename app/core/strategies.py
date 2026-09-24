@@ -44,7 +44,7 @@ class AttackStrategy:
     def _sync_frame_size(self, frame):
         self.config.set_target_size_from_frame(frame)
 
-    def _reward_checkpoint(self, frame=None, selected=None):
+    def _reward_checkpoint(self, frame=None, selected=None, selected_scale_template=True):
         """Clear event overlays before input; reselect a displaced troop/spell.
 
         Return a current frame and whether a choice interrupted deployment.
@@ -66,7 +66,7 @@ class AttackStrategy:
             self._sync_frame_size(frame)
             if selected:
                 roi = self.vision.bottom_half_region(frame)
-                x, y = self.vision.find_template(frame, selected, region=roi)
+                x, y = self.vision.find_template(frame, selected, region=roi, scale_template=selected_scale_template)
                 if x is None:
                     return None, True  # The previously selected troop is exhausted.
                 self.input.click(x, y, pause=0.2, rand=False)
@@ -470,6 +470,36 @@ slot nearest the top vertex is left empty (virtual troop at the apex).
             logger.info('Deployed golden dragons')
         return bool(ev and ev.is_set())
 
+    def deploy_secondary_troop(self, frame, stop_event = None):
+        """Deploy the configured second troop in a count of perimeter taps."""
+        template_path = getattr(self, 'secondary_template', '')
+        count = getattr(self, 'secondary_count', 0)
+        if not template_path or count <= 0:
+            return False
+        ev = stop_event or self.stop_event
+        frame, _ = self._reward_checkpoint(frame)
+        if frame is None:
+            return False
+        self._sync_frame_size(frame)
+        roi = self.vision.bottom_half_region(frame)
+        tx, ty = self.vision.find_template(frame, template_path, region=roi, scale_template=False)
+        if tx is None:
+            logger.warning('Secondary troop image did not match an icon on the troop bar; skipping')
+            return False
+        self.input.click(tx, ty, pause=0.2, rand=False)
+        for _ in range(count):
+            if ev and ev.is_set():
+                return True
+            fresh, handled = self._reward_checkpoint(selected=template_path, selected_scale_template=False)
+            if handled and fresh is None:
+                return False
+            if fresh is not None:
+                frame = fresh
+            px, py = self._random_diamond_perimeter_point(frame)
+            self.input.click(px, py, pause=0.2, rand=False)
+        logger.info('Deployed %d secondary troops using the custom troop image', count)
+        return True
+
     
     def deploy_spells(self, frame):
         frame, _ = self._reward_checkpoint(frame)
@@ -513,11 +543,13 @@ slot nearest the top vertex is left empty (virtual troop at the apex).
 
 class TroopSpamStrategy(AttackStrategy):
     
-    def __init__(self, input_service, vision_service, config, stop_event, troop_name, duration, status_callback = None, earthquake_method = EARTHQUAKE_METHOD_CURVE):
+    def __init__(self, input_service, vision_service, config, stop_event, troop_name, duration, status_callback = None, earthquake_method = EARTHQUAKE_METHOD_CURVE, secondary_template = '', secondary_count = 12):
         super().__init__(input_service, vision_service, config, stop_event, earthquake_method = earthquake_method)
         self.troop_name = troop_name
         self.duration = duration
         self.status_callback = status_callback
+        self.secondary_template = secondary_template
+        self.secondary_count = secondary_count
 
     
     def execute(self, frame, stop_event = None):
@@ -587,6 +619,13 @@ class TroopSpamStrategy(AttackStrategy):
             frame = self.input.window_service.screenshot()
             if not frame is None:
                 self._sync_frame_size(frame)
+                self.deploy_secondary_troop(frame, ev)
+                if ev and ev.is_set():
+                    return True
+                frame = self.input.window_service.screenshot()
+                if frame is None:
+                    return True
+                self._sync_frame_size(frame)
                 if self.deploy_golden_drags_if_present(frame, ev):
                     return True
                 self.deploy_heroes(frame)
@@ -605,9 +644,12 @@ class TroopSpamStrategy(AttackStrategy):
 
 class EdragStrategy(AttackStrategy):
     
-    def __init__(self, input_service, vision_service, config, stop_event, status_callback = None, earthquake_method = EARTHQUAKE_METHOD_CURVE):
+    def __init__(self, input_service, vision_service, config, stop_event, status_callback = None, earthquake_method = EARTHQUAKE_METHOD_CURVE, secondary_template = '', secondary_count = 12):
         super().__init__(input_service, vision_service, config, stop_event, earthquake_method = earthquake_method)
         self.status_callback = status_callback
+        self.secondary_template = secondary_template
+        self.secondary_count = secondary_count
+        self.troop_name = 'edrag'
 
     
     def execute(self, frame, stop_event = None):
@@ -624,6 +666,13 @@ class EdragStrategy(AttackStrategy):
             return True
         frame = self.input.window_service.screenshot()
         if not frame is None:
+            self._sync_frame_size(frame)
+            self.deploy_secondary_troop(frame, ev)
+            if ev and ev.is_set():
+                return True
+            frame = self.input.window_service.screenshot()
+            if frame is None:
+                return True
             self._sync_frame_size(frame)
             if self.deploy_golden_drags_if_present(frame, ev):
                 return True

@@ -1,14 +1,17 @@
 '''Run page — attack, schedule, modes, live status, controls.'''
 from __future__ import annotations
 from typing import Callable, List, Optional
+from pathlib import Path
 from PySide6.QtCore import QSettings, Qt, QTimer
-from PySide6.QtWidgets import QButtonGroup, QGridLayout, QHBoxLayout, QLabel, QMessageBox, QScrollArea, QSpinBox, QVBoxLayout, QWidget
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import QApplication, QButtonGroup, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QMessageBox, QScrollArea, QSpinBox, QVBoxLayout, QWidget
 from app.config import check_game_window_aspect_for_start
 from app.ui.qt._constants import ATTACK_STRATEGIES, BUILDER_BASE_ATTACK_STRATEGIES, BUILDER_BASE_ATTACK_STRATEGIES_UNDER_DEV, BUILDER_BASE_PRIORITISE_LABELS
 from app.ui.qt.bot_controller import BotController
 from app.ui.qt.dialogs import RankedAttackConfirmDialog, show_bb_prioritise_help, show_error, show_under_development
 from app.ui.qt.theme import SPACING, TOKENS
 from app.ui.qt.widgets import Card, HelpButton, SectionTitle, StepperButton, ToggleSwitch, chip_button, danger_button, neutral_button, primary_button, segment_button
+from app.utils.common import ensure_dir, get_user_app_data_dir
 from app.utils.player_list_store import PlayerEntry, load_players
 
 class RunPage(QWidget):
@@ -117,7 +120,82 @@ class RunPage(QWidget):
             self._strategy_group.addButton(btn, i)
             row.addWidget(btn)
         card.card_layout.addLayout(row)
+        secondary_row = QHBoxLayout()
+        self._use_secondary_troop = ToggleSwitch('Use secondary troop', parent = card)
+        self._use_secondary_troop.toggled.connect(self._on_secondary_troop_toggle)
+        secondary_row.addWidget(self._use_secondary_troop)
+        card.card_layout.addLayout(secondary_row)
+        image_row = QHBoxLayout()
+        self._secondary_image_preview = QLabel('No troop image')
+        self._secondary_image_preview.setObjectName('SecondaryTroopPreview')
+        self._secondary_image_preview.setFixedSize(54, 54)
+        self._secondary_image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._secondary_image_preview.setStyleSheet(f"background: {TOKENS['sidebar']}; border: 1px solid {TOKENS['border_hi']}; border-radius: 6px;")
+        image_row.addWidget(self._secondary_image_preview)
+        self._secondary_upload = neutral_button('Upload image', parent = card)
+        self._secondary_upload.clicked.connect(self._select_secondary_image)
+        image_row.addWidget(self._secondary_upload)
+        self._secondary_paste = neutral_button('Paste image', parent = card)
+        self._secondary_paste.clicked.connect(self._paste_secondary_image)
+        image_row.addWidget(self._secondary_paste)
+        self._secondary_image_hint = QLabel('Use a tight crop of the troop icon from the deploy bar.')
+        self._secondary_image_hint.setWordWrap(True)
+        self._secondary_image_hint.setStyleSheet(f"color: {TOKENS['text_muted']};")
+        image_row.addWidget(self._secondary_image_hint, 1)
+        image_row.addWidget(SectionTitle('Troops to deploy'))
+        self._secondary_count = QSpinBox()
+        self._secondary_count.setObjectName('SecondaryTroopCount')
+        self._secondary_count.setRange(1, 100)
+        self._secondary_count.setValue(12)
+        self._secondary_count.setFixedSize(64, 28)
+        self._secondary_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        image_row.addWidget(self._secondary_count)
+        card.card_layout.addLayout(image_row)
+        self._on_secondary_troop_toggle(False)
         return card
+
+    @staticmethod
+    def _secondary_image_path():
+        return get_user_app_data_dir() / 'secondary_troop.png'
+
+    def _on_secondary_troop_toggle(self, enabled):
+        for widget in (self._secondary_upload, self._secondary_paste, self._secondary_count):
+            widget.setEnabled(bool(enabled))
+
+    def _show_secondary_image(self):
+        path = self._secondary_image_path()
+        image = QImage(str(path)) if path.is_file() else QImage()
+        if image.isNull():
+            self._secondary_image_preview.setPixmap(QPixmap())
+            self._secondary_image_preview.setText('No troop image')
+            return False
+        self._secondary_image_preview.setText('')
+        self._secondary_image_preview.setPixmap(QPixmap.fromImage(image).scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        return True
+
+    def _save_secondary_image(self, image):
+        if image is None or image.isNull():
+            show_error(self.window(), 'Secondary troop', 'The selected image could not be read.')
+            return False
+        ensure_dir(self._secondary_image_path().parent)
+        image = image.convertToFormat(QImage.Format.Format_RGB32)
+        if not image.save(str(self._secondary_image_path()), 'PNG'):
+            show_error(self.window(), 'Secondary troop', 'Could not save the troop image.')
+            return False
+        self._show_secondary_image()
+        return True
+
+    def _select_secondary_image(self):
+        filename, _ = QFileDialog.getOpenFileName(self, 'Select secondary troop image', '', 'Images (*.png *.jpg *.jpeg *.bmp *.webp)')
+        if filename:
+            self._save_secondary_image(QImage(filename))
+
+    def _paste_secondary_image(self):
+        image = QApplication.clipboard().image()
+        if image.isNull():
+            show_error(self.window(), 'Secondary troop', 'The clipboard does not contain an image. Copy a troop icon image first.')
+            return
+        self._save_secondary_image(image)
 
     
     def _build_bb_attack_card(self):
@@ -468,12 +546,18 @@ class RunPage(QWidget):
         minutes = self._settings.value('run/minutes', 15, type = int)
         if 1 <= minutes <= 999:
             self._minutes_spin.setValue(minutes)
+        self._use_secondary_troop.setChecked(self._settings.value('run/useSecondaryTroop', False, type = bool))
+        self._secondary_count.setValue(self._settings.value('run/secondaryTroopCount', 12, type = int))
+        self._show_secondary_image()
+        self._on_secondary_troop_toggle(self._use_secondary_troop.isChecked())
 
     def _save_choices(self):
         self._settings.setValue('run/autoUpgrade', self._get_auto_upgrade_mode())
         self._settings.setValue('run/upgradeWalls', self._upgrade_walls.isChecked())
         self._settings.setValue('run/untilMaxed', self._until_maxed.isChecked())
         self._settings.setValue('run/minutes', self._minutes_spin.value())
+        self._settings.setValue('run/useSecondaryTroop', self._use_secondary_troop.isChecked())
+        self._settings.setValue('run/secondaryTroopCount', self._secondary_count.value())
 
     
     def _get_minutes(self):
@@ -520,8 +604,15 @@ class RunPage(QWidget):
                 return None
         if builder_base and self._get_bb_prioritise() == 'elixir' and not self._confirm_bb_elixir_prioritise():  # [recovered: decompiler inverted both conditions]
             return None
+        secondary_template = ''
+        if not builder_base and self._use_secondary_troop.isChecked():
+            secondary_image = self._secondary_image_path()
+            if not secondary_image.is_file():
+                show_error(self.window(), 'Secondary troop', 'Upload or paste a troop icon image before starting with secondary troop enabled.')
+                return None
+            secondary_template = str(secondary_image)
         self._save_choices()
-        self._controller.start(method = method, minutes = mins, star_bonus = star_bonus, ranked_fill = ranked_fill, upgrade_walls = False if builder_base else self._upgrade_walls.isChecked(), multi_run_players = multi_arg, builder_base = builder_base, loot_prioritise = self._get_bb_prioritise() if builder_base else 'both', auto_upgrade = 'off' if builder_base else self._get_auto_upgrade_mode())
+        self._controller.start(method = method, minutes = mins, star_bonus = star_bonus, ranked_fill = ranked_fill, upgrade_walls = False if builder_base else self._upgrade_walls.isChecked(), multi_run_players = multi_arg, builder_base = builder_base, loot_prioritise = self._get_bb_prioritise() if builder_base else 'both', auto_upgrade = 'off' if builder_base else self._get_auto_upgrade_mode(), secondary_troop_template = secondary_template, secondary_troop_count = self._secondary_count.value())
 
     
     def is_star_bonus_enabled(self):

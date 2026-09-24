@@ -8,6 +8,7 @@ from app.core.strategies import AttackStrategy, EdragStrategy, TroopSpamStrategy
 from app.core.upgrader import AUTO_UPGRADE_MODES, LIVE_UPGRADE_MODES, MODE_OFF, UpgradeAdvisor
 from app.core.village_state import read_hud_triplet_stable, read_village_state, read_village_state_stable
 from app.services.input import InputService
+from app.services.loot_ocr import LootOCR
 from app.services.vision import BOTTOM_HALF_BOT_TEMPLATES, TOP_HALF_BOT_TEMPLATES, VisionService
 from app.services.window import WindowService
 from app.utils.common import get_template_path
@@ -62,6 +63,7 @@ class Bot:
         self.input = InputService(self.window, self.stop_event)
         self.vision = VisionService()
         self._battle_rewards = BattleRewards(self.window, self.input, self.stop_event)
+        self.loot_ocr = LootOCR()
         self.running = False
         self._earthquake_method = EARTHQUAKE_METHOD_CURVE
         self._loot_totals = (0, 0, 0)
@@ -71,7 +73,7 @@ class Bot:
         self._suppress_loot_negative_error_once = False
 
     
-    def start(self, method, run_time_minutes, star_bonus = False, status_callback = None, loot_callback = None, multi_run_players = None, ranked_fill = False, upgrade_walls = False, earthquake_method = EARTHQUAKE_METHOD_CURVE, builder_base = False, loot_prioritise = 'both', wall_upgrade_threshold = 0, auto_upgrade = MODE_OFF, reserve_builders = 1, state_callback = None, upgrade_order = None):
+    def start(self, method, run_time_minutes, star_bonus = False, status_callback = None, loot_callback = None, multi_run_players = None, ranked_fill = False, upgrade_walls = False, earthquake_method = EARTHQUAKE_METHOD_CURVE, builder_base = False, loot_prioritise = 'both', wall_upgrade_threshold = 0, auto_upgrade = MODE_OFF, reserve_builders = 1, state_callback = None, upgrade_order = None, min_gold = 0, min_elixir = 0, min_dark_elixir = 0, max_next_skips = 50, battle_end_delay = 20, loot_match_condition = 'any', secondary_troop_template = '', secondary_troop_count = 12):
         '''Starts the bot loop. With ``multi_run_players``, runs a full session per enabled player.
         ``run_time_minutes <= 0`` (single Home Village runs only) means UNLIMITED — farm,
         upgrade and idle until the user stops the bot ("run until maxed").'''
@@ -96,7 +98,15 @@ class Bot:
         self._reserve_builders = max(0, int(reserve_builders or 0))
         self._upgrade_order = upgrade_order
         self._advisor = None  # one UpgradeAdvisor per session (it holds execution cooldowns)
-        logger.info(f'''Bot started. Method: {method}, Time: {'unlimited' if unlimited else f'{run_time_minutes}m'}, StarBonus: {star_bonus}, MultiRun: {mr}, RankedFill: {ranked_fill}, UpgradeWalls: {upgrade_walls}, WallThreshold: {self._wall_upgrade_threshold}, AutoUpgrade: {self._auto_upgrade_mode}, ReserveBuilders: {self._reserve_builders}, Earthquake: {earthquake_method}, BuilderBase: {builder_base}, LootPrioritise: {loot_prioritise}''')
+        self._min_gold = max(0, int(min_gold or 0))
+        self._min_elixir = max(0, int(min_elixir or 0))
+        self._min_dark_elixir = max(0, int(min_dark_elixir or 0))
+        self._max_next_skips = max(1, int(max_next_skips or 50))
+        self._battle_end_delay = max(0, int(battle_end_delay if battle_end_delay is not None else 20))
+        self._loot_match_condition = str(loot_match_condition or 'any').strip().lower()
+        self._secondary_troop_template = str(secondary_troop_template or '').strip()
+        self._secondary_troop_count = max(1, min(100, int(secondary_troop_count or 12)))
+        logger.info(f'''Bot started. Method: {method}, Time: {'unlimited' if unlimited else f'{run_time_minutes}m'}, StarBonus: {star_bonus}, MultiRun: {mr}, RankedFill: {ranked_fill}, UpgradeWalls: {upgrade_walls}, WallThreshold: {self._wall_upgrade_threshold}, AutoUpgrade: {self._auto_upgrade_mode}, ReserveBuilders: {self._reserve_builders}, MinGold: {self._min_gold:,}, MinElixir: {self._min_elixir:,}, MinDE: {self._min_dark_elixir:,}, MaxSkips: {self._max_next_skips}, MatchMode: {self._loot_match_condition}, Delay: {self._battle_end_delay}s, Earthquake: {earthquake_method}, BuilderBase: {builder_base}, LootPrioritise: {loot_prioritise}''')
 
         try:
 
@@ -789,6 +799,7 @@ deselect, which would eat the upcoming Attack click.'''
     def _wait_for_attack_with_nudge(self, timeout = 10, error = True):
         '''Poll bottom-half ``attack.png``; dismiss ``okay`` / ``exit`` popups first; else empty + scroll.'''
         start = time.time()
+        next_capital_scan = 0.0
         while time.time() - start < timeout:
             self._check_stop()
             frame = self.window.screenshot()
@@ -801,6 +812,16 @@ deselect, which would eat the upcoming Attack click.'''
                 if self.stop_event.wait(0.25):
                     return (None, None)
                 continue
+            now = time.monotonic()
+            if now >= next_capital_scan:
+                next_capital_scan = now + 1.5
+                (chx, chy) = self._find_capital_return_home_button(frame)
+                if chx:
+                    logger.info('Attack wait: Capital screen detected â€” clicking Return Home')
+                    self.input.click(chx, chy, pause = 0.3)
+                    if self.stop_event.wait(0.5):
+                        return (None, None)
+                    continue
             (sx, sy) = self.vision.find_template(frame, 'surrender.png')
             if sx:
                 # We are inside a live battle — nudge clicks would deploy troops. Bail out and
@@ -1250,11 +1271,65 @@ deselect, which would eat the upcoming Attack click.'''
                     logger.warning('rankedattackconfirm.png not found after attack2.png')
                 else:
                     self.input.click(rx, ry, pause = 0.1)
-        self._wait_for_any_image(('surrender.png', 'endbattle.png'), timeout = 30)
-        frame = self.window.screenshot()
-        if frame is None:
-            return None
-        self._update_config_size(frame)
+        skips = 0
+        max_skips = getattr(self, '_max_next_skips', 50)
+        cb = getattr(self, '_status_callback', None)
+        has_loot_filter = not ranked_fill and (getattr(self, '_min_gold', 0) > 0 or getattr(self, '_min_elixir', 0) > 0 or getattr(self, '_min_dark_elixir', 0) > 0)
+
+        while True:
+            self._wait_for_any_image(('surrender.png', 'endbattle.png'), timeout = 30)
+            frame = self.window.screenshot()
+            if frame is None:
+                return None
+            self._update_config_size(frame)
+            if self.stop_event.wait(0.3):
+                return None
+            frame = self.window.screenshot()
+            if frame is None:
+                return None
+            
+            gold, elixir, de = self.loot_ocr.read_battle_loot(frame)
+            logger.info(f"Raid loot found: Gold={gold:,}, Elixir={elixir:,}, DE={de:,} (Target: G>={getattr(self, '_min_gold', 0):,}, E>={getattr(self, '_min_elixir', 0):,}, DE>={getattr(self, '_min_dark_elixir', 0):,})")
+            if cb:
+                cb(f"Loot: G {gold:,} | E {elixir:,} | DE {de:,}")
+            
+            if not has_loot_filter:
+                break
+            
+            meets_gold = (gold >= self._min_gold) if self._min_gold > 0 else False
+            meets_elixir = (elixir >= self._min_elixir) if self._min_elixir > 0 else False
+            meets_de = (de >= self._min_dark_elixir) if self._min_dark_elixir > 0 else False
+            huge_loot = (gold >= 1500000 or elixir >= 1500000)
+
+            if getattr(self, '_loot_match_condition', 'any') == 'all':
+                meets_loot = (self._min_gold <= 0 or meets_gold) and (self._min_elixir <= 0 or meets_elixir) and (self._min_dark_elixir <= 0 or meets_de)
+            else:
+                meets_loot = meets_gold or meets_elixir or meets_de
+            
+            if meets_loot or huge_loot:
+                logger.info(f"Target accepted! Gold={gold:,}, Elixir={elixir:,}, DE={de:,}")
+                if cb:
+                    cb(f"Target found: G {gold:,} | E {elixir:,}")
+                break
+            
+            skips += 1
+            if skips >= max_skips:
+                logger.warning(f"Reached max Next skips limit ({max_skips}). Attacking current base.")
+                if cb:
+                    cb(f"Max skips ({skips}) reached -> attacking")
+                break
+            
+            logger.info(f"Loot below threshold. Clicking Next... (Skip #{skips}/{max_skips})")
+            if cb:
+                cb(f"Skipping base ({skips}/{max_skips})...")
+            
+            (h_f, w_f) = frame.shape[:2]
+            next_x = int(0.9135 * w_f)
+            next_y = int(0.7185 * h_f)
+            self.input.click(next_x, next_y, pause = 0.2)
+            
+            if self.stop_event.wait(2.5):
+                return None
         (h, w) = frame.shape[:2]
         cy = h // 2
         cx = w // 2
@@ -1276,15 +1351,17 @@ deselect, which would eat the upcoming Attack click.'''
     def _get_strategy(self, method_id):
         cb = getattr(self, '_status_callback', None)
         eq = getattr(self, '_earthquake_method', EARTHQUAKE_METHOD_CURVE)
+        secondary = getattr(self, '_secondary_troop_template', '')
+        secondary_count = getattr(self, '_secondary_troop_count', 12)
         if method_id == 1:
-            return TroopSpamStrategy(self.input, self.vision, self.config, self.stop_event, 'sneaky', 15, status_callback = cb, earthquake_method = eq)
+            return TroopSpamStrategy(self.input, self.vision, self.config, self.stop_event, 'sneaky', 15, status_callback = cb, earthquake_method = eq, secondary_template = secondary, secondary_count = secondary_count)
         if method_id == 2:
-            return TroopSpamStrategy(self.input, self.vision, self.config, self.stop_event, 'superminion', 3.1, status_callback = cb, earthquake_method = eq)
+            return TroopSpamStrategy(self.input, self.vision, self.config, self.stop_event, 'superminion', 3.1, status_callback = cb, earthquake_method = eq, secondary_template = secondary, secondary_count = secondary_count)
         if method_id == 3:
-            return TroopSpamStrategy(self.input, self.vision, self.config, self.stop_event, 'valkyrie', 5.5, status_callback = cb, earthquake_method = eq)
+            return TroopSpamStrategy(self.input, self.vision, self.config, self.stop_event, 'valkyrie', 5.5, status_callback = cb, earthquake_method = eq, secondary_template = secondary, secondary_count = secondary_count)
         if method_id == 4:
-            return EdragStrategy(self.input, self.vision, self.config, self.stop_event, status_callback = cb, earthquake_method = eq)
-        return TroopSpamStrategy(self.input, self.vision, self.config, self.stop_event, 'sneaky', 15, status_callback = cb, earthquake_method = eq)
+            return EdragStrategy(self.input, self.vision, self.config, self.stop_event, status_callback = cb, earthquake_method = eq, secondary_template = secondary, secondary_count = secondary_count)
+        return TroopSpamStrategy(self.input, self.vision, self.config, self.stop_event, 'sneaky', 15, status_callback = cb, earthquake_method = eq, secondary_template = secondary, secondary_count = secondary_count)
 
     
     def _wait_for_battle_end(self, is_sneaky):
@@ -1300,10 +1377,36 @@ deselect, which would eat the upcoming Attack click.'''
                 self.input.click(bx, by, pause = 0.1)
                 return None
             return None
+
+        delay = getattr(self, '_battle_end_delay', 20)
         (bx, by) = self._wait_for_image('endbattle.png', timeout = 60, error = False)
         if bx:
+            if delay > 0:
+                logger.info(f"1 Star / End Battle active. Waiting {delay}s for troops to clean up additional loot...")
+                cb = getattr(self, '_status_callback', None)
+                if cb:
+                    cb(f"1 Star reached - looting for {delay}s...")
+                
+                start_delay = time.time()
+                while time.time() - start_delay < delay:
+                    if self.stop_event.wait(1.0):
+                        return None
+                    frame = self.window.screenshot()
+                    if frame is not None:
+                        (ox, oy) = self.vision.find_template(frame, 'okay.png')
+                        if ox:
+                            logger.info("Battle naturally finished during post-1-star delay.")
+                            return None
+
+                frame = self.window.screenshot()
+                if frame is not None:
+                    (nbx, nby) = self.vision.find_template(frame, 'endbattle.png')
+                    if nbx:
+                        bx, by = nbx, nby
+
             self.input.click(bx, by, pause = 0.1)
             return None
+
         (sx, sy) = self._wait_for_image('surrender.png', timeout = 2, error = False)
         if sx:
             self.input.click(sx, sy, pause = 0.1)
@@ -1441,6 +1544,13 @@ Returns (``"return"`` | ``"chest"``, x, y) or (None, None, None) on timeout.
                 if self.stop_event.wait(0.3):
                     return None
                 continue
+            (chx, chy) = self._find_capital_return_home_button(frame)
+            if chx:
+                logger.info('Recovery: Capital screen detected â€” clicking Return Home')
+                self.input.click(chx, chy, pause = 0.3)
+                if self.stop_event.wait(0.5):
+                    return None
+                continue
             (sx, sy) = self.vision.find_template(frame, 'surrender.png')
             if sx:
                 logger.info('Recovery: live battle — surrendering to get home')
@@ -1480,6 +1590,43 @@ Returns (``"return"`` | ``"chest"``, x, y) or (None, None, None) on timeout.
             if not self.stop_event.wait(1):
                 continue
         return None
+
+    def _find_capital_return_home_button(self, frame):
+        """Locate Capital's distinct lower-left Return Home button from its text."""
+        if frame is None or frame.size == 0:
+            return (None, None)
+        h, w = frame.shape[:2]
+        region = (0, int(h * 0.72), max(1, int(w * 0.19)), max(1, int(h * 0.28)))
+        words = self.vision.find_words_ocr(
+            frame,
+            region=region,
+            min_confidence=20,
+            preprocess=True,
+            white_text=False,
+            tesseract_config='--psm 11'
+        )
+        return_words = [word for word in words if 'return' in word.text.lower()]
+        home_words = [word for word in words if 'home' in word.text.lower()]
+        best = None
+        best_distance = float('inf')
+        max_line_gap = max(20, int(h * 0.11))
+        max_word_gap = max(30, int(w * 0.12))
+        for return_word in return_words:
+            for home_word in home_words:
+                dx = abs(return_word.center[0] - home_word.center[0])
+                dy = abs(return_word.center[1] - home_word.center[1])
+                if dx > max_word_gap or dy > max_line_gap:
+                    continue
+                distance = dx + dy
+                if distance < best_distance:
+                    best = (return_word, home_word)
+                    best_distance = distance
+        if best is None:
+            return (None, None)
+        first, second = best
+        x = (first.center[0] + second.center[0]) // 2
+        y = (first.center[1] + second.center[1]) // 2
+        return (x, y)
 
     
     def _switch_account_and_load_home(self, username):
@@ -1535,6 +1682,7 @@ Each iteration dismisses ``okay.png`` / ``exit.png`` if present, then village / 
         if self.stop_event.wait(delay):
             return (None, None)
         start = time.time()
+        next_capital_scan = 0.0
         while time.time() - start < timeout:
             self._check_stop()
             frame = self.window.screenshot()
@@ -1544,6 +1692,16 @@ Each iteration dismisses ``okay.png`` / ``exit.png`` if present, then village / 
                     if self.stop_event.wait(0.25):
                         return (None, None)
                     continue
+                now = time.monotonic()
+                if now >= next_capital_scan:
+                    next_capital_scan = now + 1.5
+                    (chx, chy) = self._find_capital_return_home_button(frame)
+                    if chx:
+                        logger.info('Account load: Capital screen detected â€” clicking Return Home')
+                        self.input.click(chx, chy, pause = 0.3)
+                        if self.stop_event.wait(0.5):
+                            return (None, None)
+                        continue
                 top_roi = VisionService.top_half_region(frame)
                 (mx, my) = self.vision.find_template(frame, 'mbuilder.png', region = top_roi)
                 if mx:
@@ -1603,6 +1761,19 @@ Each iteration dismisses ``okay.png`` / ``exit.png`` if present, then village / 
     def _ensure_correct_village(self, builder_base):
         '''Before farming: switch villages if the wrong builder portrait is showing.'''
         self._check_stop()
+        frame = self.window.screenshot()
+        if frame is not None:
+            self._update_config_size(frame)
+            if self._dismiss_okay_or_exit_on_frame(frame):
+                self._home_screen_recovery()
+                frame = self.window.screenshot()
+                if frame is not None:
+                    self._update_config_size(frame)
+            (chx, chy) = self._find_capital_return_home_button(frame)
+            if chx:
+                logger.info('Startup: Capital screen detected â€” returning to Home Village')
+                self.input.click(chx, chy, pause = 0.3)
+                self._home_screen_recovery()
         self.input.click(pause = 0.15, *self.config.get_point('empty'))
         if self.stop_event.wait(0.2):
             return None

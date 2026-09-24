@@ -15,11 +15,14 @@ These three share one routine. Per raid, in order:
    along the base edges. Start corner and direction are randomized every raid (at 16:9 it starts
    left or right; at 16:10 it may also start from the top), and each segment's duration is
    jittered ±10%.
-3. **Super Dragon**, if it's in the bar.
-4. **Siege machine** — Log Launcher first, else Siege Barracks.
-5. **Heroes**, in random order each raid: Queen, Warden, Royal Champion, King, Prince, Dragon
+3. **Secondary troop**, if enabled on the Run page. A user supplied troop icon image is matched
+   against the deploy bar, then the troop is deployed with the configured number of individual
+   taps around the perimeter. Use a tight crop of the troop icon at the current game resolution.
+4. **Super Dragon**, if it's in the bar.
+5. **Siege machine** — Log Launcher first, else Siege Barracks.
+6. **Heroes**, in random order each raid: Queen, Warden, Royal Champion, King, Prince, Dragon
    Duke. Whichever are present get dropped, then clicked a second time to fire their abilities.
-6. **Earthquake spells.**
+7. **Earthquake spells.**
 
 Because step 2 is a drag rather than individual taps, exact troop count matters less than
 filling the slot — the drag spreads whatever you're carrying along the edges.
@@ -40,7 +43,8 @@ remaining clicks land harmlessly.
 ## Edrags
 
 A different routine: **12 Electro Dragons** placed individually around the diamond perimeter,
-0.2s apart, rather than dragged. Heroes and spells follow as above.
+0.2s apart, rather than dragged. The optional secondary troop deploys after those 12 placements.
+Upload or paste a tight crop of its deploy-bar icon in the Run page. Heroes and spells follow as above.
 
 ## Builder Base
 

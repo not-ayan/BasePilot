@@ -189,7 +189,8 @@ Returns (center_x, center_y) or (None, None).
 '''
             
             try:
-                template_path = str(get_template_path(template_name))
+                candidate_path = Path(str(template_name))
+                template_path = str(candidate_path if candidate_path.is_absolute() and candidate_path.is_file() else get_template_path(template_name))
                 template = cv2.imread(template_path)
                 if template is None:
                     logger.error(f'''Template not found: {template_path}''')
@@ -1252,11 +1253,10 @@ with ``psm10_glyph_confidence``, labels include the estimated confidence.
                 return chars
             except pytesseract.TesseractNotFoundError:
                 VisionService._log_tesseract_missing()
-                
-                try:
-                    return None
-                except ValueError:
-                    []
+                return []
+            except Exception as e:
+                logger.debug(f'find_chars_ocr error: {e}')
+                return []
 
 
 
@@ -1336,12 +1336,10 @@ Returns:
                 return words
             except pytesseract.TesseractNotFoundError:
                 VisionService._log_tesseract_missing()
-                
-                try:
-                    return None
-                except (ValueError, TypeError):
-                    []
-                    conf = -1
+                return []
+            except Exception as e:
+                logger.debug(f'find_words_ocr error: {e}')
+                return []
 
 
 
@@ -1561,6 +1559,8 @@ with one inner list per Y-cluster (characters left-to-right) after clustering, f
                 cfg = tesseract_config
             _ = min_confidence
             chars = VisionService.find_chars_ocr(screen_img, region = region, preprocess = preprocess, white_text = white_text, tesseract_config = cfg, cc_filter_blobs = cc_filter_blobs, cc_min_area = cc_min_area, cc_max_area = cc_max_area, save_preprocess_png = save_preprocess_png, roi_upscale = roi_upscale, ocr_debug_box_path = ocr_debug_box_path, ocr_debug_boxes_png_path = ocr_debug_boxes_png_path, psm10_glyph_confidence = psm10_glyph_confidence)
+            if not chars:
+                return []
             digit_chars = [ c for c in chars if c.text.isdigit() or c.text == 'l' ]  # [recovered: decompiler dropped the isdigit() disjunct; 'l' is kept because merge_numeric_cluster maps it to '1']
             if not digit_chars:
                 return []
@@ -1598,7 +1598,32 @@ Default ``roi_upscale`` is :data:`HUD_TOP_RIGHT_NUMBERS_ROI_UPSCALE` (BGR enlarg
             cfg.set_target_size_from_frame(screen_img)
             (h_s, w_s) = screen_img.shape[:2]
             roi = VisionService.numbers_hud_roi_top_right(w_s, h_s)
-            return VisionService.extract_grouped_numbers_in_region(screen_img, roi, min_confidence = min_confidence, white_text = white_text, tesseract_config = tesseract_config, y_tolerance_px = y_tolerance_px, cc_filter_blobs = cc_filter_blobs, cc_min_area = cc_min_area, cc_max_area = cc_max_area, preprocess = preprocess, save_preprocess_png = save_preprocess_png, roi_upscale = roi_upscale, ocr_debug_box_path = ocr_debug_box_path, ocr_debug_boxes_png_path = ocr_debug_boxes_png_path, psm10_glyph_confidence = psm10_glyph_confidence, hud_debug_char_clusters_out = hud_debug_char_clusters_out, allow_hud_ocr_debug = allow_hud_ocr_debug)
+            res = VisionService.extract_grouped_numbers_in_region(screen_img, roi, min_confidence = min_confidence, white_text = white_text, tesseract_config = tesseract_config, y_tolerance_px = y_tolerance_px, cc_filter_blobs = cc_filter_blobs, cc_min_area = cc_min_area, cc_max_area = cc_max_area, preprocess = preprocess, save_preprocess_png = save_preprocess_png, roi_upscale = roi_upscale, ocr_debug_box_path = ocr_debug_box_path, ocr_debug_boxes_png_path = ocr_debug_boxes_png_path, psm10_glyph_confidence = psm10_glyph_confidence, hud_debug_char_clusters_out = hud_debug_char_clusters_out, allow_hud_ocr_debug = allow_hud_ocr_debug)
+            if not res:
+                try:
+                    from app.services.loot_ocr import LootOCR
+                    ocr = LootOCR()
+                    rx, ry, rw, rh = roi
+                    hud_crop = screen_img[ry:ry+rh, rx:rx+rw]
+                    if hud_crop is not None and hud_crop.size > 0:
+                        ch = hud_crop.shape[0]
+                        g_crop = hud_crop[0:int(ch*0.38), :]
+                        e_crop = hud_crop[int(ch*0.35):int(ch*0.72), :]
+                        de_crop = hud_crop[int(ch*0.70):, :]
+                        g_val = ocr.parse_number(ocr.recognize_digits(ocr.preprocess_image(g_crop)))
+                        e_val = ocr.parse_number(ocr.recognize_digits(ocr.preprocess_image(e_crop)))
+                        de_val = ocr.parse_number(ocr.recognize_digits(ocr.preprocess_image(de_crop)))
+                        grouped = []
+                        if g_val > 0:
+                            grouped.append(GroupedNumber(str(g_val), rx, ry, rw, 30, 100.0))
+                        if e_val > 0:
+                            grouped.append(GroupedNumber(str(e_val), rx, ry + int(ch*0.4), rw, 30, 100.0))
+                        if de_val > 0:
+                            grouped.append(GroupedNumber(str(de_val), rx, ry + int(ch*0.75), rw, 30, 100.0))
+                        return grouped
+                except Exception:
+                    pass
+            return res
 
         
         @staticmethod
@@ -1622,15 +1647,11 @@ elixir left‑to‑right in the OCR ROI — take clusters sorted by horizontal c
         
         @staticmethod
         def parse_hud_resources_triplet(groups):
-            '''
-From :meth:`extract_top_right_hud_numbers` clusters, derive ``(gold, elixir, dark_elixir)``:
-the home HUD stacks the three resource bars vertically (gold, elixir, dark top to bottom),
-so the three **topmost** decoded numbers are taken in vertical order. Returns ``None`` if
-fewer than three numeric clusters are available.
-'''
-            # The HUD numbers are right-aligned, so a horizontal sort orders them by digit
-            # count (7-digit elixir would land before 6-digit gold) — vertical order is the
-            # only stable assignment.
+            """
+From :meth:`extract_top_right_hud_numbers` clusters, derive ``(gold, elixir, dark_elixir)``.
+"""
+            if not groups:
+                return None
             scored = []
             for g in groups:
                 v = VisionService.parse_loot_amount_from_grouped_text(g.text)
@@ -1638,10 +1659,13 @@ fewer than three numeric clusters are available.
                     continue
                 cy = float(g.top) + float(g.height) * 0.5
                 scored.append((cy, v))
-            scored.sort(key = (lambda t: t[0]))
-            if len(scored) < 3:
+            scored.sort(key = lambda t: t[0])
+            if len(scored) < 2:
                 return None
-            return (scored[0][1], scored[1][1], scored[2][1])
+            gold = scored[0][1]
+            elixir = scored[1][1]
+            dark = scored[2][1] if len(scored) >= 3 else 0
+            return (gold, elixir, dark)
 
         
         @staticmethod
