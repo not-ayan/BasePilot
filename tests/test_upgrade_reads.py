@@ -54,8 +54,9 @@ class UpgradeReadTests(unittest.TestCase):
         self.assertIsNone(point)
 
     @patch('app.core.upgrade_menu._classify_resource_icon', return_value='elixir')
+    @patch('app.core.upgrade_menu.detect_build_menu', return_value=None)
     @patch('app.core.upgrade_menu.VisionService.find_words_ocr')
-    def test_complete_cost_and_red_veto(self, ocr, icon):
+    def test_complete_cost_and_red_veto(self, ocr, mock_build, icon):
         frame = np.zeros((731, 1299, 3), dtype=np.uint8)
         label = SimpleNamespace(text='Army Camp', left=533, top=162, width=82, height=13)
         cost = SimpleNamespace(text='10000000', left=705, top=162, width=90, height=13)

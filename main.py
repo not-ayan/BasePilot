@@ -18,6 +18,21 @@ if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS') and not os.environ
     if os.path.isfile(_bundled_tess):
         os.environ['TESSERACT_CMD'] = _bundled_tess
 
+if '--profile' in sys.argv:
+    try:
+        os.environ['BASEPILOT_PROFILE'] = sys.argv[sys.argv.index('--profile') + 1]
+    except IndexError:
+        pass
+
+if __name__ == '__main__' and '--release-self-test' in sys.argv:
+    freeze_support()
+    from app.utils.release_check import run_release_check
+    try:
+        _report = sys.argv[sys.argv.index('--release-self-test') + 1]
+    except IndexError:
+        raise SystemExit('--release-self-test requires a JSON report path')
+    sys.exit(run_release_check(_report))
+
 from app.ui.qt.app import run_gui
 from app.utils.logger import setup_logger
 from app.utils.tesseract_env import configure_tesseract
@@ -31,11 +46,11 @@ def main():
             from app.services.display import DisplayService
             DisplayService().restore_if_pending()
         except Exception:
-            logger.warning('Display restore-if-pending check failed', exc_info = True)
+            logger.warning('Display restore-if-pending check failed', exc_info=True)
         logger.info('Starting Application...')
         run_gui()
     except Exception as e:
-        logger.critical(f'''Unhandled exception: {e}''', exc_info = True)
+        logger.critical(f'Unhandled exception: {e}', exc_info=True)
         sys.exit(1)
 
 

@@ -1,0 +1,23 @@
+{
+  "tile_size": 40,
+  "columns": "0123456789",
+  "variants": {
+    "0": 115,
+    "1": 14,
+    "2": 3,
+    "3": 10,
+    "4": 10,
+    "5": 26,
+    "6": 2,
+    "7": 7,
+    "8": 2,
+    "9": 3
+  },
+  "source": "Native October 20 UI price glyphs; white/red antialias variants",
+  "source_fixtures": [
+    "build_affordable_heroes",
+    "build_red_prices",
+    "build_gold_prices",
+    "build"
+  ]
+}
